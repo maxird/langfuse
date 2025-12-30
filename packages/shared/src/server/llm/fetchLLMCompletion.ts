@@ -25,6 +25,7 @@ import GCPServiceAccountKeySchema, {
   BedrockCredentialSchema,
   VertexAIConfigSchema,
   BEDROCK_USE_DEFAULT_CREDENTIALS,
+  VERTEXAI_USE_DEFAULT_CREDENTIALS,
 } from "../../interfaces/customLLMProviderConfigSchemas";
 import {
   ChatMessage,
@@ -54,6 +55,7 @@ const PROVIDERS_WITH_REQUIRED_USER_MESSAGE = [
   LLMAdapter.VertexAI,
   LLMAdapter.GoogleAIStudio,
   LLMAdapter.Anthropic,
+  LLMAdapter.Bedrock,
 ];
 
 const transformSystemMessageToUserMessage = (
@@ -186,7 +188,7 @@ export async function fetchLLMCompletion(
     // Ensure provider schema compliance
     finalMessages = transformSystemMessageToUserMessage(messages);
   } else {
-    finalMessages = messages.map((message) => {
+    finalMessages = messages.map((message, idx) => {
       // For arbitrary content types, convert to string safely
       const safeContent =
         typeof message.content === "string"
@@ -199,7 +201,9 @@ export async function fetchLLMCompletion(
         message.role === ChatMessageRole.System ||
         message.role === ChatMessageRole.Developer
       )
-        return new SystemMessage(safeContent);
+        return idx === 0
+          ? new SystemMessage(safeContent)
+          : new HumanMessage(safeContent);
 
       if (message.type === ChatMessageType.ToolResult) {
         return new ToolMessage({
@@ -234,22 +238,57 @@ export async function fetchLLMCompletion(
     | ChatVertexAI
     | ChatGoogleGenerativeAI;
   if (modelParams.adapter === LLMAdapter.Anthropic) {
-    chatModel = new ChatAnthropic({
+    const isClaude45Family =
+      modelParams.model?.includes("claude-sonnet-4-5") ||
+      modelParams.model?.includes("claude-opus-4-1") ||
+      modelParams.model?.includes("claude-opus-4-5") ||
+      modelParams.model?.includes("claude-haiku-4-5");
+
+    const chatOptions: Record<string, any> = {
       anthropicApiKey: apiKey,
       anthropicApiUrl: baseURL ?? undefined,
       modelName: modelParams.model,
-      temperature: modelParams.temperature,
       maxTokens: modelParams.max_tokens,
-      topP: modelParams.top_p,
       callbacks: finalCallbacks,
       clientOptions: {
         maxRetries,
         timeout: timeoutMs,
         ...(proxyAgent && { httpAgent: proxyAgent }),
       },
+      temperature: modelParams.temperature,
+      topP: modelParams.top_p,
       invocationKwargs: modelParams.providerOptions,
-    });
+    };
+
+    chatModel = new ChatAnthropic(chatOptions);
+
+    if (isClaude45Family) {
+      if (chatModel.topP === -1) {
+        chatModel.topP = undefined;
+      }
+
+      // TopP and temperature cannot be specified both,
+      // but Langchain is setting placeholder values despite that
+      if (
+        modelParams.temperature !== undefined &&
+        modelParams.top_p === undefined
+      ) {
+        chatModel.topP = undefined;
+      }
+
+      if (
+        modelParams.top_p !== undefined &&
+        modelParams.temperature === undefined
+      ) {
+        chatModel.temperature = undefined;
+      }
+    }
   } else if (modelParams.adapter === LLMAdapter.OpenAI) {
+    const processedBaseURL = processOpenAIBaseURL({
+      url: baseURL,
+      modelName: modelParams.model,
+    });
+
     chatModel = new ChatOpenAI({
       openAIApiKey: apiKey,
       modelName: modelParams.model,
@@ -262,7 +301,7 @@ export async function fetchLLMCompletion(
       callbacks: finalCallbacks,
       maxRetries,
       configuration: {
-        baseURL,
+        baseURL: processedBaseURL,
         defaultHeaders: extraHeaders,
         ...(proxyAgent && { httpAgent: proxyAgent }),
       },
@@ -314,10 +353,26 @@ export async function fetchLLMCompletion(
       additionalModelRequestFields: modelParams.providerOptions as any,
     });
   } else if (modelParams.adapter === LLMAdapter.VertexAI) {
-    const credentials = GCPServiceAccountKeySchema.parse(JSON.parse(apiKey));
     const { location } = config
       ? VertexAIConfigSchema.parse(config)
       : { location: undefined };
+
+    // Handle both explicit credentials and default provider chain (ADC)
+    // Only allow default provider chain in self-hosted or internal AI features
+    const shouldUseDefaultCredentials =
+      apiKey === VERTEXAI_USE_DEFAULT_CREDENTIALS && !isLangfuseCloud;
+
+    // When using ADC, authOptions must be undefined to use google-auth-library's default credential chain
+    // This supports: GKE Workload Identity, Cloud Run service accounts, GCE metadata service, gcloud auth
+    // Security: We intentionally ignore user-provided projectId when using ADC to prevent
+    // privilege escalation attacks where users could access other GCP projects via the server's credentials
+    const authOptions = shouldUseDefaultCredentials
+      ? undefined // Always use ADC auto-detection, never allow user-specified projectId
+      : {
+          credentials: GCPServiceAccountKeySchema.parse(JSON.parse(apiKey)),
+          projectId: GCPServiceAccountKeySchema.parse(JSON.parse(apiKey))
+            .project_id,
+        };
 
     // Requests time out after 60 seconds for both public and private endpoints by default
     // Reference: https://cloud.google.com/vertex-ai/docs/predictions/get-online-predictions#send-request
@@ -329,20 +384,24 @@ export async function fetchLLMCompletion(
       callbacks: finalCallbacks,
       maxRetries,
       location,
-      authOptions: {
-        projectId: credentials.project_id,
-        credentials,
-      },
+      authOptions,
+      ...(modelParams.providerOptions && {
+        additionalModelRequestFields: modelParams.providerOptions,
+      }),
     });
   } else if (modelParams.adapter === LLMAdapter.GoogleAIStudio) {
     chatModel = new ChatGoogleGenerativeAI({
       model: modelParams.model,
+      baseUrl: baseURL ?? undefined,
       temperature: modelParams.temperature,
       maxOutputTokens: modelParams.max_tokens,
       topP: modelParams.top_p,
       callbacks: finalCallbacks,
       maxRetries,
       apiKey,
+      ...(modelParams.providerOptions && {
+        additionalModelRequestFields: modelParams.providerOptions,
+      }),
     });
   } else {
     // eslint-disable-next-line no-unused-vars
@@ -446,4 +505,23 @@ export async function fetchLLMCompletion(
   } finally {
     await processTracedEvents();
   }
+}
+
+/**
+ * Process baseURL template for OpenAI adapter only.
+ * Replaces {model} placeholder with actual model name.
+ * This is a workaround for proxies that require the model name in the URL azureOpenAIBasePath
+ * while having OpenAI compliance otherwise
+ */
+function processOpenAIBaseURL(params: {
+  url: string | null | undefined;
+  modelName: string;
+}): string | null | undefined {
+  const { url, modelName } = params;
+
+  if (!url || !url.includes("{model}")) {
+    return url;
+  }
+
+  return url.replace("{model}", modelName);
 }

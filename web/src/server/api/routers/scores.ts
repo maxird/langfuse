@@ -18,21 +18,25 @@ import {
   timeFilter,
   UpdateAnnotationScoreData,
   validateDbScore,
-  ScoreSource,
   LangfuseNotFoundError,
   InternalServerError,
   BatchActionQuerySchema,
   BatchActionType,
+  ActionId,
   BatchExportTableName,
   type ScoreDomain,
   CreateAnnotationScoreData,
   type ScoreConfigDomain,
+  ScoreSourceEnum,
+  ScoreDataTypeEnum,
+  CORRECTION_NAME,
 } from "@langfuse/shared";
 import {
   getScoresGroupedByNameSourceType,
   getScoresUiCount,
   getScoresUiTable,
   getScoreNames,
+  getScoreStringValues,
   getTracesGroupedByTags,
   getTracesGroupedByName,
   getTracesGroupedByUsers,
@@ -56,7 +60,11 @@ import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEnti
 import { createBatchActionJob } from "@/src/features/table/server/createBatchActionJob";
 import { TRPCError } from "@trpc/server";
 import { randomUUID } from "crypto";
-import { isTraceScore } from "@/src/features/scores/lib/helpers";
+import {
+  isNumericDataType,
+  isTraceScore,
+} from "@/src/features/scores/lib/helpers";
+import { toDomainWithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
 
 const ScoreFilterOptions = z.object({
   projectId: z.string(), // Required for protectedProjectProcedure
@@ -75,7 +83,6 @@ type AllScoresReturnType = Omit<ScoreDomain, "metadata"> & {
   authorUserImage: string | null;
   authorUserName: string | null;
   hasMetadata: boolean;
-  executionTraceId: string | null;
 };
 
 export const scoresRouter = createTRPCRouter({
@@ -158,10 +165,7 @@ export const scoresRouter = createTRPCRouter({
           message: `No score with id ${input.scoreId} in project ${input.projectId} in Clickhouse`,
         });
       }
-      return {
-        ...score,
-        metadata: score.metadata ? JSON.stringify(score.metadata) : null,
-      };
+      return toDomainWithStringifiedMetadata(score);
     }),
   countAll: protectedProjectProcedure
     .input(ScoreAllOptions)
@@ -187,25 +191,27 @@ export const scoresRouter = createTRPCRouter({
     )
     .query(async ({ input }) => {
       const { timestampFilter } = input;
-      const [names, tags, traceNames, userIds] = await Promise.all([
-        getScoreNames(input.projectId, timestampFilter ?? []),
-        getTracesGroupedByTags({
-          projectId: input.projectId,
-          filter: timestampFilter ?? [],
-        }),
-        getTracesGroupedByName(
-          input.projectId,
-          tracesTableUiColumnDefinitions,
-          timestampFilter ?? [],
-        ),
-        getTracesGroupedByUsers(
-          input.projectId,
-          timestampFilter ?? [],
-          undefined,
-          100, // limit to top 100 users
-          0,
-        ),
-      ]);
+      const [names, tags, traceNames, userIds, stringValues] =
+        await Promise.all([
+          getScoreNames(input.projectId, timestampFilter ?? []),
+          getTracesGroupedByTags({
+            projectId: input.projectId,
+            filter: timestampFilter ?? [],
+          }),
+          getTracesGroupedByName(
+            input.projectId,
+            tracesTableUiColumnDefinitions,
+            timestampFilter ?? [],
+          ),
+          getTracesGroupedByUsers(
+            input.projectId,
+            timestampFilter ?? [],
+            undefined,
+            100, // limit to top 100 users
+            0,
+          ),
+          getScoreStringValues(input.projectId, timestampFilter ?? []),
+        ]);
 
       return {
         name: names.map((i) => ({ value: i.name, count: i.count })),
@@ -215,6 +221,7 @@ export const scoresRouter = createTRPCRouter({
           count: tn.count,
         })),
         userId: userIds.map((u) => ({ value: u.user, count: u.count })),
+        stringValue: stringValues,
       };
     }),
   deleteMany: protectedProjectProcedure
@@ -246,7 +253,7 @@ export const scoresRouter = createTRPCRouter({
       if (input.isBatchAction && input.query) {
         return createBatchActionJob({
           projectId: input.projectId,
-          actionId: "score-delete",
+          actionId: ActionId.ScoreDelete,
           actionType: BatchActionType.Delete,
           tableName: BatchExportTableName.Scores,
           session: ctx.session,
@@ -356,7 +363,7 @@ export const scoresRouter = createTRPCRouter({
       const score = !!clickhouseScore
         ? {
             ...clickhouseScore,
-            value: input.value ?? null,
+            value: input.value,
             stringValue: input.stringValue ?? null,
             comment: input.comment ?? null,
             metadata: {},
@@ -371,7 +378,7 @@ export const scoresRouter = createTRPCRouter({
             ...inflatedParams,
             // only trace and session scores are supported for annotation
             datasetRunId: null,
-            value: input.value ?? null,
+            value: input.value,
             stringValue: input.stringValue ?? null,
             dataType: input.dataType ?? null,
             configId: input.configId ?? null,
@@ -379,7 +386,7 @@ export const scoresRouter = createTRPCRouter({
             comment: input.comment ?? null,
             metadata: {},
             authorUserId: ctx.session.user.id,
-            source: ScoreSource.ANNOTATION,
+            source: ScoreSourceEnum.ANNOTATION,
             queueId: input.queueId ?? null,
             executionTraceId: null,
             createdAt: new Date(),
@@ -396,14 +403,17 @@ export const scoresRouter = createTRPCRouter({
         observation_id: inflatedParams.observationId,
         session_id: inflatedParams.sessionId,
         name: input.name,
-        value: input.value !== null ? input.value : undefined,
-        source: ScoreSource.ANNOTATION,
+        value: input.value,
+        source: ScoreSourceEnum.ANNOTATION,
         comment: input.comment,
         author_user_id: ctx.session.user.id,
         config_id: input.configId,
         data_type: input.dataType,
         string_value: input.stringValue,
         queue_id: input.queueId,
+        created_at: convertDateToClickhouseDateTime(score.createdAt),
+        updated_at: convertDateToClickhouseDateTime(score.updatedAt),
+        metadata: score.metadata as Record<string, string>,
       });
 
       await auditLog({
@@ -431,7 +441,7 @@ export const scoresRouter = createTRPCRouter({
       const score = await getScoreById({
         projectId: input.projectId,
         scoreId: input.id,
-        source: ScoreSource.ANNOTATION,
+        source: ScoreSourceEnum.ANNOTATION,
       });
 
       if (!score) {
@@ -517,17 +527,20 @@ export const scoresRouter = createTRPCRouter({
           observation_id: inflatedParams.observationId,
           session_id: inflatedParams.sessionId,
           name: input.name,
-          value: input.value !== null ? input.value : undefined,
-          source: ScoreSource.ANNOTATION,
+          value: input.value,
+          source: ScoreSourceEnum.ANNOTATION,
           comment: input.comment,
           author_user_id: ctx.session.user.id,
           config_id: input.configId,
           data_type: input.dataType,
           string_value: input.stringValue,
           queue_id: input.queueId,
+          created_at: convertDateToClickhouseDateTime(new Date()),
+          updated_at: convertDateToClickhouseDateTime(new Date()),
+          metadata: {},
         });
 
-        updatedScore = {
+        const baseScore = {
           id: input.id,
           projectId: input.projectId,
           environment: input.environment ?? "default",
@@ -536,20 +549,34 @@ export const scoresRouter = createTRPCRouter({
           sessionId: inflatedParams.sessionId,
           datasetRunId: null,
           name: input.name,
-          dataType: input.dataType ?? null,
+          value: input.value,
+          dataType: input.dataType,
           configId: input.configId ?? null,
           metadata: {},
           executionTraceId: null,
           createdAt: new Date(),
           updatedAt: new Date(),
-          source: ScoreSource.ANNOTATION,
-          value: input.value ?? null,
-          stringValue: input.stringValue ?? null,
+          source: ScoreSourceEnum.ANNOTATION,
           comment: input.comment ?? null,
           authorUserId: ctx.session.user.id,
           queueId: input.queueId ?? null,
           timestamp,
+          longStringValue: "",
         };
+
+        if (isNumericDataType(baseScore.dataType)) {
+          updatedScore = {
+            ...baseScore,
+            dataType: ScoreDataTypeEnum.NUMERIC,
+            stringValue: null,
+          };
+        } else {
+          updatedScore = {
+            ...baseScore,
+            dataType: input.dataType as "CATEGORICAL" | "BOOLEAN",
+            stringValue: input.stringValue!,
+          };
+        }
 
         await auditLog({
           session: ctx.session,
@@ -576,14 +603,16 @@ export const scoresRouter = createTRPCRouter({
             validateConfigAgainstBody({
               body: {
                 ...score,
-                value: input.value ?? null,
-                stringValue: input.stringValue ?? null,
+                value: input.value,
+                stringValue: isNumericDataType(score.dataType)
+                  ? null
+                  : input.stringValue!,
                 comment: input.comment ?? null,
-              },
+              } as ScoreDomain,
               config: config as ScoreConfigDomain,
               context: "ANNOTATION",
             });
-          } catch (error) {
+          } catch (_error) {
             throw new TRPCError({
               code: "PRECONDITION_FAILED",
               message:
@@ -601,7 +630,7 @@ export const scoresRouter = createTRPCRouter({
           comment: input.comment,
           author_user_id: ctx.session.user.id,
           queue_id: input.queueId,
-          source: ScoreSource.ANNOTATION,
+          source: ScoreSourceEnum.ANNOTATION,
           name: score.name,
           data_type: score.dataType,
           config_id: score.configId,
@@ -609,17 +638,33 @@ export const scoresRouter = createTRPCRouter({
           observation_id: score.observationId,
           session_id: score.sessionId,
           environment: score.environment,
+          created_at: convertDateToClickhouseDateTime(score.createdAt),
+          updated_at: convertDateToClickhouseDateTime(score.updatedAt),
+          metadata: score.metadata as Record<string, string>,
         });
 
-        updatedScore = {
+        const baseScore = {
           ...score,
-          value: input.value ?? null,
-          stringValue: input.stringValue ?? null,
+          value: input.value,
           comment: input.comment ?? null,
           authorUserId: ctx.session.user.id,
           queueId: input.queueId ?? null,
           timestamp: score.timestamp,
         };
+
+        if (isNumericDataType(score.dataType)) {
+          updatedScore = {
+            ...baseScore,
+            dataType: ScoreDataTypeEnum.NUMERIC,
+            stringValue: null,
+          };
+        } else {
+          updatedScore = {
+            ...baseScore,
+            dataType: input.dataType as "CATEGORICAL" | "BOOLEAN",
+            stringValue: input.stringValue!,
+          };
+        }
 
         await auditLog({
           session: ctx.session,
@@ -655,7 +700,7 @@ export const scoresRouter = createTRPCRouter({
       const clickhouseScore = await getScoreById({
         projectId: input.projectId,
         scoreId: input.id,
-        source: ScoreSource.ANNOTATION,
+        source: ScoreSourceEnum.ANNOTATION,
       });
       if (!clickhouseScore) {
         logger.warn(
@@ -677,6 +722,123 @@ export const scoresRouter = createTRPCRouter({
       await deleteScores(input.projectId, [clickhouseScore.id]);
 
       return validateDbScore(clickhouseScore);
+    }),
+  upsertCorrection: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        id: z.string(),
+        timestamp: z.date(),
+        traceId: z.string(),
+        observationId: z.string().optional(),
+        value: z.string(),
+        environment: z.string().optional(),
+        queueId: z.string().optional(),
+      }),
+    )
+    .mutation(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "scores:CUD",
+      });
+
+      const clickhouseTrace = await getTraceById({
+        traceId: input.traceId,
+        projectId: input.projectId,
+        clickhouseFeatureTag: "annotations-trpc",
+      });
+
+      if (!clickhouseTrace) {
+        logger.error(
+          `No trace with id ${input.traceId} in project ${input.projectId} in Clickhouse`,
+        );
+        throw new LangfuseNotFoundError(
+          `No trace with id ${input.traceId} in project ${input.projectId} in Clickhouse`,
+        );
+      }
+
+      const clickhouseScore = await searchExistingAnnotationScore(
+        input.projectId,
+        input.observationId ?? null,
+        input.traceId,
+        null,
+        CORRECTION_NAME,
+        undefined,
+        ScoreDataTypeEnum.CORRECTION,
+      );
+
+      const timestamp = input.timestamp;
+
+      const score = !!clickhouseScore
+        ? {
+            ...clickhouseScore,
+            value: 0,
+            stringValue: null,
+            comment: null,
+            metadata: {},
+            authorUserId: ctx.session.user.id,
+            queueId: input.queueId ?? null,
+            longStringValue: input.value,
+          }
+        : {
+            id: input.id,
+            projectId: input.projectId,
+            environment: input.environment ?? "default",
+            traceId: input.traceId,
+            observationId: input.observationId ?? null,
+            sessionId: null,
+            // only trace and session scores are supported for annotation
+            datasetRunId: null,
+            value: 0,
+            stringValue: null,
+            dataType: ScoreDataTypeEnum.CORRECTION,
+            configId: null,
+            name: CORRECTION_NAME,
+            comment: null,
+            metadata: {},
+            authorUserId: ctx.session.user.id,
+            source: ScoreSourceEnum.ANNOTATION,
+            queueId: input.queueId ?? null,
+            executionTraceId: null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            timestamp,
+            longStringValue: input.value,
+          };
+
+      await upsertScore({
+        id: score.id, // Reuse ID that was generated by Prisma
+        timestamp: convertDateToClickhouseDateTime(timestamp),
+        project_id: input.projectId,
+        environment: input.environment ?? "default",
+        trace_id: input.traceId,
+        observation_id: input.observationId ?? null,
+        session_id: null,
+        name: CORRECTION_NAME,
+        value: 0,
+        source: ScoreSourceEnum.ANNOTATION,
+        comment: null,
+        author_user_id: ctx.session.user.id,
+        config_id: null,
+        data_type: ScoreDataTypeEnum.CORRECTION,
+        string_value: null,
+        queue_id: input.queueId ?? null,
+        created_at: convertDateToClickhouseDateTime(score.createdAt),
+        updated_at: convertDateToClickhouseDateTime(score.updatedAt),
+        metadata: score.metadata as Record<string, string>,
+        long_string_value: input.value,
+      });
+
+      await auditLog({
+        session: ctx.session,
+        resourceType: "score",
+        resourceId: score.id,
+        action: "create",
+        after: score,
+      });
+
+      return validateDbScore(score);
     }),
   /**
    * @deprecated, use getScoreColumns instead

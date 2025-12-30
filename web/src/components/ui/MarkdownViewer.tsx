@@ -26,7 +26,7 @@ import {
   type OpenAIOutputAudioType,
   isOpenAITextContentPart,
   isOpenAIImageContentPart,
-} from "@/src/components/schemas/ChatMlSchema";
+} from "@langfuse/shared";
 import { type z } from "zod/v4";
 import { ResizableImage } from "@/src/components/ui/resizable-image";
 import { LangfuseMediaView } from "@/src/components/ui/LangfuseMediaView";
@@ -71,7 +71,7 @@ const getSafeUrl = (href: string | undefined | null): string | null => {
     });
 
     return sanitized || null;
-  } catch (error) {
+  } catch (_error) {
     return null;
   }
 };
@@ -282,7 +282,7 @@ function MarkdownRenderer({
         </MemoizedReactMarkdown>
       </div>
     );
-  } catch (error) {
+  } catch (_error) {
     // fallback to JSON view if markdown parsing fails
 
     return (
@@ -362,17 +362,20 @@ export function MarkdownView({
   return (
     <div className={cn("overflow-hidden")} key={theme}>
       {title ? (
-        <MarkdownJsonViewHeader
-          title={title}
-          titleIcon={titleIcon}
-          handleOnValueChange={handleOnValueChange}
-          handleOnCopy={handleOnCopy}
-          controlButtons={controlButtons}
-        />
+        <>
+          <MarkdownJsonViewHeader
+            title={title}
+            titleIcon={titleIcon}
+            handleOnValueChange={handleOnValueChange}
+            handleOnCopy={handleOnCopy}
+            controlButtons={controlButtons}
+          />
+          <div className="border-t" />
+        </>
       ) : null}
       <div
         className={cn(
-          "grid grid-flow-row gap-2 border-t px-1 py-3",
+          "io-message-content grid grid-flow-row gap-2 px-1 py-2",
           title === "assistant" || title === "Output" || title === "Model"
             ? "bg-accent-light-green"
             : "",

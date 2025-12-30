@@ -7,7 +7,7 @@ service:
   base-path: /api/public
   endpoints:
     get:
-      docs: Get Project associated with API key
+      docs: Get Project associated with API key (requires project-scoped API key). You can use GET /api/public/organizations/projects to get all projects with an organization-scoped key.
       method: GET
       path: /projects
       response: Projects
@@ -102,10 +102,22 @@ types:
     properties:
       data: list<Project>
 
+  Organization:
+    properties:
+      id:
+        type: string
+        docs: The unique identifier of the organization
+      name:
+        type: string
+        docs: The name of the organization
+
   Project:
     properties:
       id: string
       name: string
+      organization:
+        type: Organization
+        docs: The organization this project belongs to
       metadata:
         type: map<string, unknown>
         docs: Metadata for the project

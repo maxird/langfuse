@@ -1,11 +1,37 @@
 import { convertApiProvidedFilterToClickhouseFilter } from "@langfuse/shared/src/server";
 import {
-  convertToScore,
+  convertClickhouseScoreToDomain,
   StringFilter,
+  StringOptionsFilter,
   type ScoreRecordReadType,
   queryClickhouse,
   measureAndReturn,
 } from "@langfuse/shared/src/server";
+import {
+  removeObjectKeys,
+  ScoreDataTypeEnum,
+  type ScoreDataTypeType,
+  type ScoreDomain,
+} from "@langfuse/shared";
+
+/**
+ * Converts a ScoreDomain object to API format.
+ * For CORRECTION scores, moves longStringValue to stringValue for API compatibility.
+ * For other score types, removes longStringValue.
+ */
+export const convertScoreToPublicApi = <T extends ScoreDomain>(
+  score: T,
+): Omit<T, "longStringValue"> & { stringValue?: string | null } => {
+  if (score.dataType === ScoreDataTypeEnum.CORRECTION) {
+    const { longStringValue, ...rest } = score;
+    return {
+      ...rest,
+      stringValue: longStringValue,
+    };
+  }
+
+  return removeObjectKeys(score, ["longStringValue"]);
+};
 
 export type ScoreQueryType = {
   page: number;
@@ -21,6 +47,7 @@ export type ScoreQueryType = {
   scoreId?: string;
   configId?: string;
   sessionId?: string;
+  datasetRunId?: string;
   queueId?: string;
   traceTags?: string | string[];
   operator?: string;
@@ -36,11 +63,16 @@ export type ScoreQueryType = {
 export const _handleGenerateScoresForPublicApi = async ({
   props,
   scoreScope,
+  scoreDataTypes,
 }: {
   props: ScoreQueryType;
   scoreScope: "traces_only" | "all";
+  scoreDataTypes?: readonly ScoreDataTypeType[];
 }) => {
-  const { scoresFilter, tracesFilter } = generateScoreFilter(props);
+  const { scoresFilter, tracesFilter } = generateScoreFilter(
+    props,
+    scoreDataTypes,
+  );
   const appliedScoresFilter = scoresFilter.apply();
   const appliedTracesFilter = tracesFilter.apply();
 
@@ -56,6 +88,7 @@ export const _handleGenerateScoresForPublicApi = async ({
           s.name as name,
           s.value as value,
           s.string_value as string_value,
+          s.long_string_value as long_string_value,
           s.author_user_id as author_user_id,
           s.created_at as created_at,
           s.updated_at as updated_at,
@@ -97,7 +130,7 @@ export const _handleGenerateScoresForPublicApi = async ({
           ${appliedScoresFilter.query ? `AND ${appliedScoresFilter.query}` : ""}
           ${tracesFilter.length() > 0 ? `AND ${appliedTracesFilter.query}` : ""}
       ORDER BY
-          s.timestamp desc
+          s.timestamp desc, s.event_ts desc
       LIMIT
           1 BY s.id, s.project_id
       ${props.limit !== undefined && props.page !== undefined ? `LIMIT {limit: Int32} OFFSET {offset: Int32}` : ""}
@@ -138,17 +171,21 @@ export const _handleGenerateScoresForPublicApi = async ({
         preferredClickhouseService: "ReadOnly",
       });
 
-      return records.map((record) => ({
-        ...convertToScore(record),
-        trace:
-          record.trace_id !== null
-            ? {
-                userId: record.user_id,
-                tags: record.tags,
-                environment: record.trace_environment,
-              }
-            : null,
-      }));
+      return records.map((record) => {
+        const domainScore = convertClickhouseScoreToDomain(record);
+        const apiScore = convertScoreToPublicApi(domainScore);
+        return {
+          ...apiScore,
+          trace:
+            record.trace_id !== null
+              ? {
+                  userId: record.user_id,
+                  tags: record.tags,
+                  environment: record.trace_environment,
+                }
+              : null,
+        };
+      });
     },
   });
 };
@@ -161,11 +198,16 @@ export const _handleGenerateScoresForPublicApi = async ({
 export const _handleGetScoresCountForPublicApi = async ({
   props,
   scoreScope,
+  scoreDataTypes,
 }: {
   props: ScoreQueryType;
   scoreScope: "traces_only" | "all";
+  scoreDataTypes?: readonly ScoreDataTypeType[];
 }) => {
-  const { scoresFilter, tracesFilter } = generateScoreFilter(props);
+  const { scoresFilter, tracesFilter } = generateScoreFilter(
+    props,
+    scoreDataTypes,
+  );
   const appliedScoresFilter = scoresFilter.apply();
   const appliedTracesFilter = tracesFilter.apply();
 
@@ -297,6 +339,13 @@ const secureScoreFilterOptions = [
     clickhousePrefix: "s",
   },
   {
+    id: "datasetRunId",
+    clickhouseSelect: "dataset_run_id",
+    clickhouseTable: "scores",
+    filterType: "StringFilter",
+    clickhousePrefix: "s",
+  },
+  {
     id: "queueId",
     clickhouseSelect: "queue_id",
     clickhouseTable: "scores",
@@ -343,7 +392,10 @@ const secureTraceFilterOptions = [
   },
 ];
 
-const generateScoreFilter = (filter: ScoreQueryType) => {
+const generateScoreFilter = (
+  filter: ScoreQueryType,
+  scoreDataTypes?: readonly ScoreDataTypeType[],
+) => {
   const scoresFilter = convertApiProvidedFilterToClickhouseFilter(
     filter,
     secureScoreFilterOptions,
@@ -356,6 +408,20 @@ const generateScoreFilter = (filter: ScoreQueryType) => {
       value: filter.projectId,
     }),
   );
+
+  // Add version-based dataType restriction if provided
+  // This will AND with any user-provided dataType filter for proper intersection
+  if (scoreDataTypes) {
+    scoresFilter.push(
+      new StringOptionsFilter({
+        clickhouseTable: "scores",
+        field: "data_type",
+        operator: "any of",
+        values: [...scoreDataTypes],
+        tablePrefix: "s",
+      }),
+    );
+  }
 
   const tracesFilter = convertApiProvidedFilterToClickhouseFilter(
     filter,

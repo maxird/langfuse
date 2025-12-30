@@ -9,6 +9,7 @@ import {
   EventPropagationQueue,
   QueueJobs,
   redis,
+  recordGauge,
 } from "@langfuse/shared/src/server";
 import { Job } from "bullmq";
 import { env } from "../../env";
@@ -142,6 +143,12 @@ export const handleEventPropagationJob = async (
       },
     });
 
+    // Record backlog metric for observability
+    recordGauge(
+      "langfuse.event_propagation.partition_backlog",
+      partitions.length,
+    );
+
     if (partitions.length === 0) {
       logger.info(
         `[DUAL WRITE] No partitions older than 4 minutes available for processing`,
@@ -228,8 +235,14 @@ export const handleEventPropagationJob = async (
           select
             t.id,
             t.project_id,
+            t.name,
             t.user_id,
             t.session_id,
+            t.version,
+            t.release,
+            t.tags,
+            t.bookmarked,
+            t.public,
             t.metadata
           from traces t
           where t.project_id in (select arrayJoin(project_ids) from batch_stats)
@@ -251,6 +264,11 @@ export const handleEventPropagationJob = async (
           type,
           environment,
           version,
+          release,
+          tags,
+          public,
+          bookmarked,
+          trace_name,
           user_id,
           session_id,
           level,
@@ -266,26 +284,18 @@ export const handleEventPropagationJob = async (
           usage_details,
           provided_cost_details,
           cost_details,
-          total_cost,
+          usage_pricing_tier_id,
+          usage_pricing_tier_name,
+          tool_definitions,
+          tool_calls,
+          tool_call_names,
+
           input,
           output,
           metadata,
           metadata_names,
-          metadata_values,
-          -- metadata_string_names,
-          -- metadata_string_values,
-          -- metadata_number_names,
-          -- metadata_number_values,
-          -- metadata_bool_names,
-          -- metadata_bool_values,
+          metadata_raw_values,
           source,
-          service_name,
-          service_version,
-          scope_name,
-          scope_version,
-          telemetry_sdk_language,
-          telemetry_sdk_name,
-          telemetry_sdk_version,
           blob_storage_file_path,
           event_bytes,
           created_at,
@@ -304,13 +314,17 @@ export const handleEventPropagationJob = async (
             ELSE coalesce(obs.parent_observation_id, concat('t-', obs.trace_id))
           END AS parent_span_id,
           -- Convert timestamps from DateTime64(3) to DateTime64(6) via implicit conversion
-          -- Clamp start_time to 1970-01-01 or later (Unix epoch minimum) to avoid toUnixTimestamp() errors
-          greatest(obs.start_time, toDateTime64('1970-01-01', 3)) AS start_time,
+          obs.start_time,
           obs.end_time,
           obs.name,
           obs.type,
           obs.environment,
-          obs.version,
+          coalesce(obs.version, t.version) as version,
+          coalesce(t.release, '') as release,
+          t.tags as tags,
+          t.public as public,
+          t.bookmarked AND (obs.parent_observation_id IS NULL OR obs.parent_observation_id = '') AS bookmarked,
+          t.name AS trace_name,
           coalesce(t.user_id, '') AS user_id,
           coalesce(t.session_id, '') AS session_id,
           obs.level,
@@ -321,40 +335,32 @@ export const handleEventPropagationJob = async (
           obs.prompt_version,
           obs.internal_model_id AS model_id,
           obs.provided_model_name,
-          obs.model_parameters,
+          coalesce(obs.model_parameters, '{}'),
           obs.provided_usage_details,
           obs.usage_details,
           obs.provided_cost_details,
           obs.cost_details,
-          coalesce(obs.total_cost, 0) AS total_cost,
+          obs.usage_pricing_tier_id,
+          obs.usage_pricing_tier_name,
+          obs.tool_definitions,
+          obs.tool_calls,
+          obs.tool_call_names,
+
           coalesce(obs.input, '') AS input,
           coalesce(obs.output, '') AS output,
           -- Merge trace and observation metadata, with observation taking precedence (first map wins)
-          CAST(mapConcat(obs.metadata, coalesce(t.metadata, map())), 'JSON') AS metadata,
+          CAST(mapConcat(obs.metadata, coalesce(t.metadata, map())), 'JSON(max_dynamic_paths=0)') AS metadata,
           mapKeys(mapConcat(obs.metadata, coalesce(t.metadata, map()))) AS metadata_names,
-          mapValues(mapConcat(obs.metadata, coalesce(t.metadata, map()))) AS metadata_values,
-          -- mapKeys(mapConcat(obs.metadata, coalesce(t.metadata, map()))) AS metadata_string_names,
-          -- mapValues(mapConcat(obs.metadata, coalesce(t.metadata, map()))) AS metadata_string_values,
-          -- [] AS metadata_number_names,
-          -- [] AS metadata_number_values,
-          -- [] AS metadata_bool_names,
-          -- [] AS metadata_bool_values,
-          multiIf(mapContains(obs.metadata, 'resourceAttributes'), 'otel', 'ingestion-api') AS source,
-          NULL AS service_name,
-          NULL AS service_version,
-          NULL AS scope_name,
-          NULL AS scope_version,
-          NULL AS telemetry_sdk_language,
-          NULL AS telemetry_sdk_name,
-          NULL AS telemetry_sdk_version,
+          mapValues(mapConcat(obs.metadata, coalesce(t.metadata, map()))) AS metadata_raw_values,
+          multiIf(mapContains(obs.metadata, 'resourceAttributes'), 'otel-dual-write', 'ingestion-api-dual-write') AS source,
           '' AS blob_storage_file_path,
           byteSize(*) AS event_bytes,
           obs.created_at,
           obs.updated_at,
           obs.event_ts,
           obs.is_deleted
-        FROM relevant_traces t
-        RIGHT JOIN observations_batch_staging obs FINAL
+        FROM observations_batch_staging obs FINAL
+        LEFT JOIN relevant_traces t
         ON (
           obs.project_id = t.project_id AND
           obs.trace_id = t.id
@@ -403,13 +409,21 @@ export const handleEventPropagationJob = async (
         }
 
         additionalSchedules--;
-        await queue.add(QueueJobs.EventPropagationJob, {
-          timestamp: new Date(),
-          id: randomUUID(),
-          payload: {
-            partition: internalPartition.partition,
+        await queue.add(
+          QueueJobs.EventPropagationJob,
+          {
+            timestamp: new Date(),
+            id: randomUUID(),
+            payload: {
+              partition: internalPartition.partition,
+            },
           },
-        });
+          {
+            deduplication: {
+              id: `partition:${internalPartition.partition}`,
+            },
+          },
+        );
         logger.info(
           `[DUAL WRITE] Scheduled additional event propagation job for partition ${internalPartition.partition}. ` +
             `Remaining partitions: ${partitions.length}`,

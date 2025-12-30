@@ -10,11 +10,14 @@ import { env } from "../../env";
 import { ClickhouseWriter } from "../../services/ClickhouseWriter";
 import { IngestionService } from "../../services/IngestionService";
 import { prisma } from "@langfuse/shared/src/db";
+import { chunk } from "lodash";
 
 const EXPERIMENT_BACKFILL_TIMESTAMP_KEY =
   "langfuse:event-propagation:experiment-backfill:last-run";
+const EXPERIMENT_BACKFILL_LOCK_KEY = "langfuse:experiment-backfill:lock";
+const LOCK_TTL_SECONDS = 300; // 5 minutes
 
-interface DatasetRunItem {
+export interface DatasetRunItem {
   id: string;
   project_id: string;
   trace_id: string;
@@ -24,13 +27,14 @@ interface DatasetRunItem {
   dataset_run_description: string;
   dataset_run_metadata: Record<string, unknown>;
   dataset_id: string;
+  dataset_item_version: string | null;
   dataset_item_id: string;
   dataset_item_expected_output: string;
   dataset_item_metadata: Record<string, unknown>;
   created_at: string;
 }
 
-interface SpanRecord {
+export interface SpanRecord {
   project_id: string;
   trace_id: string;
   span_id: string;
@@ -41,6 +45,7 @@ interface SpanRecord {
   type: string;
   environment: string;
   version: string;
+  release: string;
   input: string;
   output: string;
   // Add other fields as needed from observations/traces
@@ -58,12 +63,22 @@ interface SpanRecord {
   provided_cost_details: Record<string, number> | null;
   cost_details: Record<string, number> | null;
   total_cost: number;
+  tool_definitions: Record<string, string>;
+  tool_calls: string[];
+  tool_call_names: string[];
+  usage_pricing_tier_id: string | null;
+  usage_pricing_tier_name: string | null;
   metadata: Record<string, unknown>;
+  source: string;
+  tags: Array<string>;
+  bookmarked: boolean;
+  public: boolean;
+  trace_name: string;
   user_id: string;
   session_id: string;
 }
 
-interface EnrichedSpan extends SpanRecord {
+export interface EnrichedSpan extends SpanRecord {
   experiment_id: string;
   experiment_name: string;
   experiment_metadata_names: string[];
@@ -71,10 +86,22 @@ interface EnrichedSpan extends SpanRecord {
   experiment_description: string;
   experiment_dataset_id: string;
   experiment_item_id: string;
+  experiment_item_version: string | null;
   experiment_item_root_span_id: string;
   experiment_item_expected_output: string;
   experiment_item_metadata_names: string[];
   experiment_item_metadata_values: Array<string | null | undefined>;
+}
+
+export interface TraceProperties {
+  name: string;
+  userId: string;
+  sessionId: string;
+  version: string;
+  release: string;
+  tags: string[];
+  bookmarked: boolean;
+  public: boolean;
 }
 
 /**
@@ -107,6 +134,7 @@ export async function getDatasetRunItemsSinceLastRun(
       dri.dataset_run_description,
       dri.dataset_run_metadata,
       dri.dataset_id,
+      dri.dataset_item_version,
       dri.dataset_item_id,
       dri.dataset_item_expected_output,
       dri.dataset_item_metadata,
@@ -161,12 +189,13 @@ export async function getRelevantObservations(
         WHEN o.id = concat('t-', o.trace_id) THEN ''
         ELSE coalesce(o.parent_observation_id, concat('t-', o.trace_id))
       END AS parent_span_id,
-      greatest(o.start_time, toDateTime64('1970-01-01', 3)) AS start_time,
-      o.end_time AS end_time,
+      o.start_time,
+      o.end_time,
       o.name,
       o.type,
       coalesce(o.environment, '') AS environment,
       coalesce(o.version, '') AS version,
+      '' as release,
       coalesce(o.input, '') AS input,
       coalesce(o.output, '') AS output,
       o.level AS level,
@@ -177,13 +206,23 @@ export async function getRelevantObservations(
       o.prompt_version AS prompt_version,
       coalesce(o.internal_model_id, '') AS model_id,
       coalesce(o.provided_model_name, '') AS provided_model_name,
-      coalesce(o.model_parameters, '') AS model_parameters,
+      coalesce(o.model_parameters, '{}') AS model_parameters,
       o.provided_usage_details AS provided_usage_details,
       o.usage_details AS usage_details,
       o.provided_cost_details AS provided_cost_details,
       o.cost_details AS cost_details,
       coalesce(o.total_cost, 0) AS total_cost,
+      o.tool_definitions,
+      o.tool_calls,
+      o.tool_call_names,
+      o.usage_pricing_tier_id,
+      o.usage_pricing_tier_name,
       o.metadata,
+      multiIf(mapContains(o.metadata, 'resourceAttributes'), 'otel-dual-write-experiments', 'ingestion-api-dual-write-experiments') AS source,
+      [] as tags,
+      false AS bookmarked,
+      false AS public,
+      '' AS trace_name,
       '' AS user_id,
       '' AS session_id
     FROM observations o
@@ -228,10 +267,11 @@ export async function getRelevantTraces(
       '' AS parent_span_id,
       t.timestamp AS start_time,
       '' AS end_time,
-      coalesce(t.name, '') AS name,
+      t.name AS name,
       'SPAN' AS type,
       coalesce(t.environment, '') AS environment,
       coalesce(t.version, '') AS version,
+      coalesce(t.release, '') AS release,
       coalesce(t.input, '') AS input,
       coalesce(t.output, '') AS output,
       '' AS level,
@@ -248,7 +288,15 @@ export async function getRelevantTraces(
       map() AS provided_cost_details,
       map() AS cost_details,
       0 AS total_cost,
+      map() AS tool_definitions,
+      [] AS tool_calls,
+      [] AS tool_call_names,
       t.metadata,
+      multiIf(mapContains(t.metadata, 'resourceAttributes'), 'otel-dual-write-experiments', 'ingestion-api-dual-write-experiments') AS source,
+      t.tags,
+      t.bookmarked,
+      t.public,
+      t.name AS trace_name,
       coalesce(t.user_id, '') AS user_id,
       coalesce(t.session_id, '') AS session_id
     FROM traces t
@@ -326,9 +374,18 @@ export function findAllChildren(
  */
 function convertToEnrichedSpanWithoutExperiment(
   span: SpanRecord,
+  traceProperties: TraceProperties | undefined,
 ): EnrichedSpan {
   return {
     ...span,
+    trace_name: traceProperties?.name || "",
+    user_id: traceProperties?.userId || "",
+    session_id: traceProperties?.sessionId || "",
+    version: span.version || traceProperties?.version || "",
+    release: traceProperties?.release || "",
+    tags: traceProperties?.tags || [],
+    bookmarked: traceProperties?.bookmarked || false,
+    public: traceProperties?.public || false,
     experiment_id: "",
     experiment_name: "",
     experiment_metadata_names: [],
@@ -336,6 +393,7 @@ function convertToEnrichedSpanWithoutExperiment(
     experiment_description: "",
     experiment_dataset_id: "",
     experiment_item_id: "",
+    experiment_item_version: null,
     experiment_item_root_span_id: "",
     experiment_item_expected_output: "",
     experiment_item_metadata_names: [],
@@ -351,7 +409,7 @@ export function enrichSpansWithExperiment(
   rootSpan: SpanRecord,
   childSpans: SpanRecord[],
   dri: DatasetRunItem,
-  traceProperties: { userId: string; sessionId: string },
+  traceProperties: TraceProperties | undefined,
 ): EnrichedSpan[] {
   const enrichedSpans: EnrichedSpan[] = [];
 
@@ -365,8 +423,14 @@ export function enrichSpansWithExperiment(
   // Enrich root span
   enrichedSpans.push({
     ...rootSpan,
-    user_id: traceProperties.userId,
-    session_id: traceProperties.sessionId,
+    trace_name: traceProperties?.name || "",
+    user_id: traceProperties?.userId || "",
+    session_id: traceProperties?.sessionId || "",
+    version: rootSpan.version || traceProperties?.version || "",
+    release: traceProperties?.release || "",
+    tags: traceProperties?.tags || [],
+    bookmarked: traceProperties?.bookmarked || false,
+    public: traceProperties?.public || false,
     experiment_id: dri.dataset_run_id,
     experiment_name: dri.dataset_run_name,
     experiment_metadata_names: experimentMetadataFlattened.names,
@@ -374,6 +438,7 @@ export function enrichSpansWithExperiment(
     experiment_description: dri.dataset_run_description,
     experiment_dataset_id: dri.dataset_id,
     experiment_item_id: dri.dataset_item_id,
+    experiment_item_version: dri.dataset_item_version,
     experiment_item_root_span_id: rootSpan.span_id,
     experiment_item_expected_output: dri.dataset_item_expected_output,
     experiment_item_metadata_names: experimentItemMetadataFlattened.names,
@@ -384,8 +449,13 @@ export function enrichSpansWithExperiment(
   for (const child of childSpans) {
     enrichedSpans.push({
       ...child,
-      user_id: traceProperties.userId,
-      session_id: traceProperties.sessionId,
+      trace_name: traceProperties?.name || "",
+      user_id: traceProperties?.userId || "",
+      session_id: traceProperties?.sessionId || "",
+      version: child.version || traceProperties?.version || "",
+      release: traceProperties?.release || "",
+      tags: traceProperties?.tags || [],
+      public: traceProperties?.public || false,
       experiment_id: dri.dataset_run_id,
       experiment_name: dri.dataset_run_name,
       experiment_metadata_names: experimentMetadataFlattened.names,
@@ -393,6 +463,7 @@ export function enrichSpansWithExperiment(
       experiment_description: dri.dataset_run_description,
       experiment_dataset_id: dri.dataset_id,
       experiment_item_id: dri.dataset_item_id,
+      experiment_item_version: dri.dataset_item_version,
       experiment_item_root_span_id: rootSpan.span_id,
       experiment_item_expected_output: dri.dataset_item_expected_output,
       experiment_item_metadata_names: experimentItemMetadataFlattened.names,
@@ -407,7 +478,7 @@ export function enrichSpansWithExperiment(
  * Write enriched spans to the events table using IngestionService.writeEvent().
  * Converts EnrichedSpan to EventInput format.
  */
-async function writeEnrichedSpans(spans: EnrichedSpan[]): Promise<void> {
+export async function writeEnrichedSpans(spans: EnrichedSpan[]): Promise<void> {
   if (spans.length === 0) {
     return;
   }
@@ -441,9 +512,14 @@ async function writeEnrichedSpans(spans: EnrichedSpan[]): Promise<void> {
       type: span.type,
       environment: span.environment || undefined,
       version: span.version || undefined,
+      release: span.release || undefined,
+      tags: span.tags || [],
+      bookmarked: span.bookmarked || false,
+      public: span.public || false,
       completionStartTime: span.completion_start_time || undefined,
 
       // User/session
+      traceName: span.trace_name || undefined,
       userId: span.user_id || undefined,
       sessionId: span.session_id || undefined,
       level: span.level || undefined,
@@ -465,6 +541,14 @@ async function writeEnrichedSpans(spans: EnrichedSpan[]): Promise<void> {
       costDetails: span.cost_details || undefined,
       totalCost: span.total_cost || undefined,
 
+      // Tool calls
+      toolDefinitions: span.tool_definitions || {},
+      toolCalls: span.tool_calls || [],
+      toolCallNames: span.tool_call_names || [],
+
+      usagePricingTierId: span.usage_pricing_tier_id || undefined,
+      usagePricingTierName: span.usage_pricing_tier_name || undefined,
+
       // I/O
       input: span.input || undefined,
       output: span.output || undefined,
@@ -473,7 +557,7 @@ async function writeEnrichedSpans(spans: EnrichedSpan[]): Promise<void> {
       metadata: span.metadata,
 
       // Source/instrumentation
-      source: "ingestion-api",
+      source: span.source,
 
       // Experiment fields
       experimentId: span.experiment_id,
@@ -483,6 +567,7 @@ async function writeEnrichedSpans(spans: EnrichedSpan[]): Promise<void> {
       experimentDescription: span.experiment_description,
       experimentDatasetId: span.experiment_dataset_id,
       experimentItemId: span.experiment_item_id,
+      experimentItemVersion: span.experiment_item_version || undefined,
       experimentItemRootSpanId: span.experiment_item_root_span_id,
       experimentItemExpectedOutput: span.experiment_item_expected_output,
       experimentItemMetadataNames: span.experiment_item_metadata_names,
@@ -554,15 +639,65 @@ export async function initializeBackfillCutoff(): Promise<Date> {
 }
 
 /**
- * Check if the experiment backfill should run based on the throttle.
+ * Check if the experiment backfill should run based on the throttle and lock acquisition.
  * (Default every 5min).
  *
- * @returns true if backfill should run (>5min since last run), false otherwise
+ * First checks if enough time has passed since the last run.
+ * Then attempts to acquire a distributed lock to ensure only one worker runs the backfill.
+ *
+ * @returns true if backfill should run (time threshold passed AND lock acquired), false otherwise
  */
 export async function shouldRunBackfill(lastRun: Date): Promise<boolean> {
+  // First check time-based throttle
   const now = new Date();
   const timeSinceLastRun = now.getTime() - lastRun.getTime();
-  return timeSinceLastRun >= env.LANGFUSE_EXPERIMENT_BACKFILL_THROTTLE_MS;
+
+  if (timeSinceLastRun < env.LANGFUSE_EXPERIMENT_BACKFILL_THROTTLE_MS) {
+    logger.debug(
+      "[EXPERIMENT BACKFILL] Skipping due to throttle (time threshold not met)",
+    );
+    return false;
+  }
+
+  // Time threshold passed, now try to acquire lock
+  if (!redis) {
+    logger.warn(
+      "[EXPERIMENT BACKFILL] Redis not available, skipping lock acquisition",
+    );
+    return true; // Allow processing if Redis is unavailable
+  }
+
+  try {
+    // Try to acquire lock using Redis SET NX (atomic test-and-set)
+    const result = await redis.set(
+      EXPERIMENT_BACKFILL_LOCK_KEY,
+      "true",
+      "EX",
+      LOCK_TTL_SECONDS,
+      "NX",
+    );
+
+    const acquired = result === "OK";
+
+    if (acquired) {
+      logger.info(
+        `[EXPERIMENT BACKFILL] Acquired backfill lock with TTL ${LOCK_TTL_SECONDS}s`,
+      );
+    } else {
+      logger.debug(
+        "[EXPERIMENT BACKFILL] Backfill is already locked by another worker",
+      );
+    }
+
+    return acquired;
+  } catch (error) {
+    logger.error(
+      "[EXPERIMENT BACKFILL] Failed to acquire backfill lock",
+      error,
+    );
+    // On error, allow processing to avoid blocking the system
+    return true;
+  }
 }
 
 /**
@@ -586,17 +721,6 @@ export async function updateBackfillTimestamp(timestamp: Date): Promise<void> {
   } catch (error) {
     logger.error("[EXPERIMENT BACKFILL] Failed to update timestamp", error);
   }
-}
-
-/**
- * Chunk an array into smaller arrays of specified size.
- */
-function chunk<T>(array: T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size));
-  }
-  return chunks;
 }
 
 /**
@@ -690,14 +814,17 @@ async function processExperimentBackfill(
     const { spanMap, childMap } = buildSpanMaps(allSpans);
 
     // Build a map of trace_id -> {userId, sessionId} for efficient lookup
-    const tracePropertiesMap = new Map<
-      string,
-      { userId: string; sessionId: string }
-    >();
+    const tracePropertiesMap = new Map<string, TraceProperties>();
     for (const trace of traces) {
       tracePropertiesMap.set(trace.trace_id, {
+        name: trace.name,
         userId: trace.user_id,
         sessionId: trace.session_id,
+        version: trace.version,
+        release: trace.release,
+        tags: trace.tags,
+        bookmarked: trace.bookmarked,
+        public: trace.public,
       });
     }
 
@@ -718,10 +845,7 @@ async function processExperimentBackfill(
       }
 
       // Get trace-level properties for this trace
-      const traceProperties = tracePropertiesMap.get(dri.trace_id) || {
-        userId: "",
-        sessionId: "",
-      };
+      const traceProperties = tracePropertiesMap.get(dri.trace_id);
 
       // Find all children recursively
       const childSpans = findAllChildren(rootSpanId, childMap);
@@ -746,7 +870,10 @@ async function processExperimentBackfill(
     // Add all remaining spans that weren't enriched (e.g., trace-derived spans that weren't roots)
     for (const span of allSpans) {
       if (!processedSpanIds.has(span.span_id)) {
-        allEnrichedSpans.push(convertToEnrichedSpanWithoutExperiment(span));
+        const traceProperties = tracePropertiesMap.get(span.trace_id);
+        allEnrichedSpans.push(
+          convertToEnrichedSpanWithoutExperiment(span, traceProperties),
+        );
       }
     }
 

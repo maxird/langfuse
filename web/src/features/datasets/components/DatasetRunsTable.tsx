@@ -372,7 +372,7 @@ export function DatasetRunsTable(props: {
             checked={row.getIsSelected()}
             onCheckedChange={(value) => row.toggleSelected(!!value)}
             aria-label="Select row"
-            className="mt-1 opacity-60 data-[state=checked]:mt-[5px]"
+            className="opacity-60"
           />
         );
       },
@@ -421,11 +421,7 @@ export function DatasetRunsTable(props: {
       cell: ({ row }) => {
         const description: DatasetRunRowData["description"] =
           row.getValue("description");
-        return (
-          <div className="max-h-full max-w-full overflow-y-auto overflow-x-hidden break-words">
-            {description}
-          </div>
-        );
+        return description;
       },
     },
     {
@@ -458,7 +454,7 @@ export function DatasetRunsTable(props: {
     },
     {
       accessorKey: "avgTotalCost",
-      header: "Total Cost (avg)",
+      header: "Trace Cost (avg)",
       id: "avgTotalCost",
       size: 130,
       enableHiding: true,
@@ -472,7 +468,7 @@ export function DatasetRunsTable(props: {
     },
     {
       accessorKey: "totalCost",
-      header: "Total Cost (sum)",
+      header: "Trace Cost (sum)",
       id: "totalCost",
       size: 130,
       enableHiding: true,

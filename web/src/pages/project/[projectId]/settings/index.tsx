@@ -21,6 +21,7 @@ import { useRouter } from "next/router";
 import { SettingsDangerZone } from "@/src/components/SettingsDangerZone";
 import { ActionButton } from "@/src/components/ActionButton";
 import { BatchExportsSettingsPage } from "@/src/features/batch-exports/components/BatchExportsSettingsPage";
+import { BatchActionsSettingsPage } from "@/src/features/batch-actions/components/BatchActionsSettingsPage";
 import { AuditLogsSettingsPage } from "@/src/ee/features/audit-log-viewer/AuditLogsSettingsPage";
 import { ModelsSettings } from "@/src/features/models/components/ModelSettings";
 import ConfigureRetention from "@/src/features/projects/components/ConfigureRetention";
@@ -170,7 +171,7 @@ export const getProjectSettingsPages = ({
     show: showProtectedLabelsSettings,
   },
   {
-    title: "Scores / Evaluation",
+    title: "Scores Configs",
     slug: "scores",
     cmdKKeywords: ["config"],
     content: <ScoreConfigSettings projectId={project.id} />,
@@ -207,6 +208,12 @@ export const getProjectSettingsPages = ({
     slug: "exports",
     cmdKKeywords: ["csv", "download", "json", "batch"],
     content: <BatchExportsSettingsPage projectId={project.id} />,
+  },
+  {
+    title: "Batch Actions",
+    slug: "batch-actions",
+    cmdKKeywords: ["bulk", "batch", "action", "dataset", "delete"],
+    content: <BatchActionsSettingsPage projectId={project.id} />,
   },
   {
     title: "Audit Logs",
@@ -310,7 +317,7 @@ const Integrations = (props: { projectId: string }) => {
             </ActionButton>
             <Button asChild variant="ghost">
               <Link
-                href="https://langfuse.com/docs/integrations/mixpanel"
+                href="https://langfuse.com/integrations/analytics/mixpanel"
                 target="_blank"
               >
                 Integration Docs ↗

@@ -58,6 +58,7 @@ const EnvSchema = z.object({
     .number()
     .positive()
     .default(24),
+  BATCH_EXPORT_S3_PART_SIZE_MIB: z.coerce.number().min(5).max(100).default(10),
   BATCH_ACTION_EXPORT_ROW_LIMIT: z.coerce.number().positive().default(50_000),
   LANGFUSE_MAX_HISTORIC_EVAL_CREATION_LIMIT: z.coerce
     .number()
@@ -91,6 +92,8 @@ const EnvSchema = z.object({
     .number()
     .positive()
     .default(3),
+
+  LANGFUSE_USE_AZURE_BLOB: z.enum(["true", "false"]).default("false"),
 
   CLICKHOUSE_URL: z.string().url(),
   CLICKHOUSE_USER: z.string(),
@@ -149,6 +152,12 @@ const EnvSchema = z.object({
   LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG: z
     .enum(["true", "false"])
     .default("true"),
+
+  // Comma-separated list of project IDs that should only export traces table (skip observations and scores)
+  LANGFUSE_BLOB_STORAGE_EXPORT_TRACE_ONLY_PROJECT_IDS: z
+    .string()
+    .optional()
+    .transform((s) => (s ? s.split(",").map((id) => id.trim()) : [])),
 
   // Flags to toggle queue consumers on or off.
   QUEUE_CONSUMER_CLOUD_USAGE_METERING_QUEUE_IS_ENABLED: z
@@ -297,6 +306,25 @@ const EnvSchema = z.object({
     .positive()
     .default(120_000), // 2 minutes
 
+  // ClickHouse mutation monitoring
+  LANGFUSE_MUTATION_MONITOR_ENABLED: z.enum(["true", "false"]).default("false"),
+  LANGFUSE_MUTATION_MONITOR_CHECK_INTERVAL_MS: z.coerce
+    .number()
+    .positive()
+    .default(60_000), // 1 minute
+  LANGFUSE_DELETION_MUTATIONS_MAX_COUNT: z.coerce
+    .number()
+    .positive()
+    .default(15),
+  LANGFUSE_DELETION_MUTATIONS_SAFE_COUNT: z.coerce
+    .number()
+    .positive()
+    .default(1),
+
+  LANGFUSE_EXPERIMENT_BACKFILL_EXCLUDE_ATTRIBUTES_KEY: z
+    .enum(["true", "false"])
+    .default("false"),
+
   // Deprecated. Do not use!
   LANGFUSE_EXPERIMENT_RETURN_NEW_RESULT: z
     .enum(["true", "false"])
@@ -313,6 +341,7 @@ const EnvSchema = z.object({
     .positive()
     .default(5),
   LANGFUSE_WEBHOOK_TIMEOUT_MS: z.coerce.number().positive().default(10000),
+  LANGFUSE_WEBHOOK_MAX_REDIRECTS: z.coerce.number().positive().default(10),
   LANGFUSE_ENTITY_CHANGE_QUEUE_PROCESSING_CONCURRENCY: z.coerce
     .number()
     .positive()

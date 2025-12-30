@@ -1,11 +1,14 @@
 import { type AnnotationScoreDataSchema } from "@/src/features/scores/schema";
 import { type AnnotateFormSchema } from "@/src/features/scores/schema";
+import { type WithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
 import {
   type ScoreSourceType,
-  type ScoreDataType,
-  type APIScoreV2,
+  type ScoreDataTypeType,
   type ScoreAggregate,
   type ScoreConfigDomain,
+  type ScoreDomain,
+  type AggregatableScoreDataType,
+  ScoreConfigDataType,
 } from "@langfuse/shared";
 import { type z } from "zod/v4";
 
@@ -30,7 +33,7 @@ export type ChartData = {
 export type ScoreData = {
   key: string;
   name: string;
-  dataType: ScoreDataType;
+  dataType: ScoreDataTypeType;
   source: string;
 };
 
@@ -55,7 +58,7 @@ export type ScoreTarget = SessionScoreTarget | TraceScoreTarget;
 export type AnnotationScore = {
   id: string | null;
   name: string;
-  dataType: ScoreDataType;
+  dataType: AnnotationScoreDataType;
   source: ScoreSourceType;
   value?: number | null;
   stringValue?: string | null;
@@ -79,7 +82,7 @@ type AnalyticsData = {
 export type AnnotateDrawerProps<Target extends ScoreTarget> = {
   projectId: string;
   scoreTarget: Target;
-  scores: APIScoreV2[];
+  scores: WithStringifiedMetadata<ScoreDomain>[];
   analyticsData?: AnalyticsData;
   scoreMetadata: {
     projectId: string;
@@ -94,11 +97,15 @@ export type AnnotationScoreSchemaType = z.infer<
   typeof AnnotationScoreDataSchema
 >;
 
+export type AnnotationScoreDataType = ScoreConfigDataType;
+export const ANNOTATION_SCORE_DATA_TYPES_ARRAY =
+  Object.values(ScoreConfigDataType);
+
 export type ScoreColumn = {
   key: string;
   name: string;
   source: ScoreSourceType;
-  dataType: ScoreDataType;
+  dataType: AggregatableScoreDataType;
 };
 
 export type ScoreConfigSelection =
@@ -107,7 +114,7 @@ export type ScoreConfigSelection =
 
 export type AnnotationForm<Target extends ScoreTarget> = {
   scoreTarget: Target;
-  serverScores: APIScoreV2[] | ScoreAggregate;
+  serverScores: WithStringifiedMetadata<ScoreDomain>[] | ScoreAggregate;
   scoreMetadata: {
     projectId: string;
     queueId?: string;
@@ -122,7 +129,7 @@ export type AnnotationScoreFormData = {
   id: string | null;
   configId: string;
   name: string;
-  dataType: ScoreDataType;
+  dataType: AnnotationScoreDataType;
   value?: number | null;
   stringValue?: string | null;
   comment?: string | null;

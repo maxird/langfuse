@@ -13,6 +13,7 @@ import { cn } from "@/src/utils/tailwind";
 import Link from "next/link";
 import { useRouter } from "next/router";
 import { type ParsedUrlQuery } from "querystring";
+import { type ReactNode } from "react";
 
 type TabDefinition = {
   value: string;
@@ -43,6 +44,10 @@ export type PageHeaderProps = {
   container?: boolean;
   tabsProps?: PageTabsProps;
   className?: string;
+  showSidebarTrigger?: boolean;
+  leadingControl?: ReactNode;
+  titleBadges?: ReactNode;
+  breadcrumbBadges?: ReactNode;
 };
 
 const PageHeader = ({
@@ -56,6 +61,10 @@ const PageHeader = ({
   tabsProps,
   container = false,
   className,
+  showSidebarTrigger = true,
+  leadingControl,
+  titleBadges,
+  breadcrumbBadges,
 }: PageHeaderProps) => {
   const router = useRouter();
   return (
@@ -71,15 +80,24 @@ const PageHeader = ({
         <div className="border-b">
           <div
             className={cn(
-              "flex min-h-12 items-center gap-3 px-3 py-2",
+              "flex min-h-11 items-center gap-3 px-3 py-2",
               container && "lg:container",
             )}
           >
-            <SidebarTrigger />
+            {showSidebarTrigger ? (
+              <SidebarTrigger />
+            ) : (
+              leadingControl && (
+                <div className="flex items-center">{leadingControl}</div>
+              )
+            )}
             <div>
               <EnvLabel />
             </div>
-            <BreadcrumbComponent items={breadcrumb} />
+            <div className="flex items-center gap-2">
+              <BreadcrumbComponent items={breadcrumb} />
+              {breadcrumbBadges}
+            </div>
           </div>
         </div>
 
@@ -87,7 +105,7 @@ const PageHeader = ({
         <div className="bg-header">
           <div
             className={cn(
-              "flex min-h-12 w-full flex-wrap items-center justify-between gap-1 px-3 py-1 md:flex-nowrap",
+              "flex min-h-11 w-full flex-wrap items-center justify-between gap-1 px-3 py-1 md:flex-nowrap",
               container && "lg:container",
             )}
           >
@@ -148,6 +166,11 @@ const PageHeader = ({
                     )}
                   </h2>
                 </div>
+                {titleBadges && (
+                  <div className="ml-1 flex items-center gap-1">
+                    {titleBadges}
+                  </div>
+                )}
               </div>
               {actionButtonsLeft && (
                 <div className="flex flex-wrap items-center gap-1 self-center">
